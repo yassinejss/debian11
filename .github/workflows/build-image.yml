@@ -1,0 +1,90 @@
+
+name: Build & Push Debian 11 Image to VCR
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "Dockerfile"
+      - ".github/workflows/build-image.yml"
+
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Image tag"
+        required: false
+        default: "latest"
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  build-and-push:
+    name: Build and push Debian 11 image
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Set image tag
+        id: tag
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          TAG="${INPUT_TAG:-latest}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Verify configuration
+        env:
+          TEAM_ID: ${{ vars.VERCEL_TEAM_ID }}
+          TEAM_SLUG: ${{ vars.VERCEL_TEAM_SLUG }}
+        run: |
+          echo "Team ID: $TEAM_ID"
+          echo "Team Slug: $TEAM_SLUG"
+
+          test -n "$TEAM_ID" || {
+            echo "Missing VERCEL_TEAM_ID variable"
+            exit 1
+          }
+
+          test -n "$TEAM_SLUG" || {
+            echo "Missing VERCEL_TEAM_SLUG variable"
+            exit 1
+          }
+
+      - name: Login to Vercel Container Registry
+        uses: vercel/vcr-action/login@v1
+        with:
+          team: ${{ vars.VERCEL_TEAM_ID }}
+          audience: https://vercel.com
+          policy: pol_33a5ecc7-e10b-496a-9758-bf24508f0de0
+
+      - name: Build and push Debian 11 image
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+          TEAM_SLUG: ${{ vars.VERCEL_TEAM_SLUG }}
+        run: |
+          IMAGE="vcr.vercel.com/${TEAM_SLUG}/debian11/debian-11-terminal:${TAG}"
+
+          echo "Building and pushing: $IMAGE"
+
+          docker buildx build \
+            --platform linux/amd64 \
+            --output "type=image,name=${IMAGE},push=true,oci-mediatypes=true,compression=zstd,compression-level=3,force-compression=true" \
+            .
+
+          echo "Image pushed successfully: $IMAGE"
+
+      - name: Summary
+        if: success()
+        run: |
+          echo "## Debian 11 Image Published" >> "$GITHUB_STEP_SUMMARY"
+          echo "Image: debian-11-terminal:${{ steps.tag.outputs.tag }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "Registry: Vercel Container Registry" >> "$GITHUB_STEP_SUMMARY"
