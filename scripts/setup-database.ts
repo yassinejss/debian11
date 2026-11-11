@@ -1,9 +1,4 @@
 #!/usr/bin/env tsx
-/**
- * Database setup script: runs all migrations and seeds the initial admin user.
- * Run with: npm run db:migrate
- */
-
 import { createClient } from "@libsql/client";
 import { readFileSync } from "fs";
 import { join } from "path";
@@ -11,24 +6,18 @@ import * as argon2 from "argon2";
 import { randomUUID } from "crypto";
 
 function userSandboxName(userId: string): string {
-  const short = userId.replace(/-/g, "").substring(0, 16);
-  return `dwt-${short}`;
+  return `dwt-${userId.replace(/-/g, "").substring(0, 16)}`;
 }
 
 async function runMigration(client: ReturnType<typeof createClient>, path: string) {
   const sql = readFileSync(path, "utf-8");
-  const statements = sql
-    .split(";")
-    .map((s) => s.trim())
-    .filter((s) => s.length > 0 && !s.startsWith("--"));
-
+  const statements = sql.split(";").map(s => s.trim()).filter(s => s.length > 0 && !s.startsWith("--"));
   for (const stmt of statements) {
-    try {
-      await client.execute(stmt);
-    } catch (err: unknown) {
+    try { await client.execute(stmt); }
+    catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
-      if (!msg.includes("already exists") && !msg.includes("duplicate")) {
-        console.warn(`⚠️  Statement warning: ${msg.substring(0, 100)}`);
+      if (!msg.includes("already exists") && !msg.includes("duplicate") && !msg.includes("no such column")) {
+        console.warn(`⚠  ${msg.substring(0, 120)}`);
       }
     }
   }
@@ -40,77 +29,37 @@ async function main() {
   const adminUsername = process.env.INITIAL_ADMIN_USERNAME;
   const adminPassword = process.env.INITIAL_ADMIN_PASSWORD;
 
-  if (!url || !authToken) {
-    console.error("❌ Missing TURSO_DATABASE_URL or TURSO_AUTH_TOKEN");
-    process.exit(1);
-  }
-  if (!adminUsername || !adminPassword) {
-    console.error("❌ Missing INITIAL_ADMIN_USERNAME or INITIAL_ADMIN_PASSWORD");
-    process.exit(1);
-  }
+  if (!url || !authToken) { console.error("❌ Missing TURSO_DATABASE_URL or TURSO_AUTH_TOKEN"); process.exit(1); }
+  if (!adminUsername || !adminPassword) { console.error("❌ Missing INITIAL_ADMIN_USERNAME or INITIAL_ADMIN_PASSWORD"); process.exit(1); }
 
-  console.log("🔌 Connecting to Turso database...");
+  console.log("🔌 Connecting to Turso...");
   const client = createClient({ url, authToken });
 
-  console.log("📦 Running migration 001 (initial schema)...");
-  await runMigration(client, join(process.cwd(), "src/database/migrations/001_initial.sql"));
-  console.log("✅ Migration 001 complete");
-
-  console.log("📦 Running migration 002 (multi-user + supervisor)...");
-  await runMigration(client, join(process.cwd(), "src/database/migrations/002_multiuser_supervisor.sql"));
-  console.log("✅ Migration 002 complete");
-
-  // Create or update admin user
-  const existing = await client.execute({
-    sql: "SELECT id FROM users WHERE username = ?",
-    args: [adminUsername],
-  });
-
-  let adminId: string;
-
-  if (existing.rows.length > 0) {
-    adminId = String(existing.rows[0].id);
-    console.log(`ℹ️  Admin user '${adminUsername}' exists (id: ${adminId})`);
-  } else {
-    console.log(`🔐 Creating admin user '${adminUsername}'...`);
-    const passwordHash = await argon2.hash(adminPassword, {
-      type: argon2.argon2id,
-      memoryCost: 65536,
-      timeCost: 3,
-      parallelism: 4,
-    });
-    adminId = randomUUID();
-    await client.execute({
-      sql: `INSERT INTO users (id, username, password_hash, is_active, is_admin, created_at, updated_at)
-            VALUES (?, ?, ?, 1, 1, unixepoch(), unixepoch())`,
-      args: [adminId, adminUsername, passwordHash],
-    });
-    console.log(`✅ Admin user '${adminUsername}' created`);
+  for (const migration of ["001_initial.sql", "002_multiuser_supervisor.sql", "003_platform_v2.sql"]) {
+    const path = join(process.cwd(), "src/database/migrations", migration);
+    console.log(`📦 Running ${migration}...`);
+    await runMigration(client, path);
+    console.log(`✅ ${migration} done`);
   }
 
-  // Ensure admin has a user_sandboxes row
+  const existing = await client.execute({ sql: "SELECT id FROM users WHERE username=?", args: [adminUsername] });
+  let adminId: string;
+  if (existing.rows.length > 0) {
+    adminId = String(existing.rows[0].id);
+    console.log(`ℹ  Admin "${adminUsername}" exists (${adminId})`);
+  } else {
+    adminId = randomUUID();
+    const hash = await argon2.hash(adminPassword, { type: argon2.argon2id, memoryCost: 65536, timeCost: 3, parallelism: 4 });
+    await client.execute({ sql: "INSERT INTO users (id,username,password_hash,is_active,is_admin,created_at,updated_at) VALUES (?,?,?,1,1,unixepoch(),unixepoch())", args: [adminId, adminUsername, hash] });
+    console.log(`✅ Admin "${adminUsername}" created`);
+  }
+
   const sandboxName = userSandboxName(adminId);
-  await client.execute({
-    sql: `INSERT OR IGNORE INTO user_sandboxes
-            (id, user_id, sandbox_name, status, ttyd_port, created_at, updated_at)
-          VALUES (?, ?, ?, 'unknown', 7681, unixepoch(), unixepoch())`,
-    args: [randomUUID(), adminId, sandboxName],
-  });
+  await client.execute({ sql: "INSERT OR IGNORE INTO user_sandboxes (id,user_id,sandbox_name,status,ttyd_port,created_at,updated_at) VALUES (?,?,?,'unknown',7681,unixepoch(),unixepoch())", args: [randomUUID(), adminId, sandboxName] });
+  await client.execute({ sql: "INSERT OR IGNORE INTO supervisor_lock (id) VALUES ('global')", args: [] });
 
-  // Ensure supervisor lock row exists
-  await client.execute({
-    sql: `INSERT OR IGNORE INTO supervisor_lock (id) VALUES ('global')`,
-    args: [],
-  });
-
-  console.log("✅ Database setup complete");
-  console.log(`\n📋 Summary:`);
-  console.log(`   Admin user: ${adminUsername}`);
-  console.log(`   Admin sandbox: ${sandboxName}`);
+  console.log(`\n✅ Database ready · Admin: ${adminUsername} · Sandbox: ${sandboxName}`);
   process.exit(0);
 }
 
-main().catch((err) => {
-  console.error("❌ Database setup failed:", err);
-  process.exit(1);
-});
+main().catch(err => { console.error("❌", err); process.exit(1); });
